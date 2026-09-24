@@ -41,7 +41,7 @@ async function createOpenCodeInjectHooks(
   platform: NodeJS.Platform = "linux",
   env: NodeJS.ProcessEnv = {},
 ): Promise<OpenCodeInjectHooks> {
-  return (await injectSubagentContextPlugin({
+  return (await injectSubagentContextPlugin.server({
     directory: "/tmp/trellis-opencode-test",
     platform,
     env,
@@ -183,7 +183,7 @@ describe("opencode session-start history detection", () => {
   });
 
   it("injects startup context onto the latest user message without mutating stored parts", async () => {
-    const hooks = (await sessionStartPlugin({
+    const hooks = (await sessionStartPlugin.server({
       directory: "/tmp/trellis-opencode-test",
     })) as TransformHooks;
 
@@ -827,7 +827,7 @@ describe("opencode inject-subagent-context (issue #264)", () => {
 
   beforeEach(async () => {
     dir = setupTrellisProject();
-    hooks = (await injectSubagentContextPlugin({
+    hooks = (await injectSubagentContextPlugin.server({
       directory: dir,
       platform: "linux",
       env: {},
@@ -985,11 +985,11 @@ describe("opencode messages.transform injection (issue #553)", () => {
   });
 
   async function loadSessionHooks(): Promise<TransformHooks> {
-    return (await sessionStartPlugin({ directory: dir })) as TransformHooks;
+    return (await sessionStartPlugin.server({ directory: dir })) as TransformHooks;
   }
 
   async function loadWorkflowHooks(): Promise<TransformHooks> {
-    return (await injectWorkflowStatePlugin({
+    return (await injectWorkflowStatePlugin.server({
       directory: dir,
     })) as TransformHooks;
   }
@@ -1258,6 +1258,385 @@ describe("opencode ephemeral transform helpers", () => {
 });
 
 // ---------------------------------------------------------------------------
+// OpenCode 2.x dual entrypoint — setup(ctx) domain hooks
+// ---------------------------------------------------------------------------
+
+interface V2ContentPart {
+  type: string;
+  text?: string;
+  metadata?: Record<string, unknown>;
+}
+
+interface V2Message {
+  role: string;
+  content: string | V2ContentPart[];
+}
+
+interface V2SessionEvent {
+  sessionID?: string;
+  agent: string;
+  messages: V2Message[];
+}
+
+interface V2ToolEvent {
+  tool: string;
+  sessionID?: string;
+  agent?: string;
+  input?: Record<string, unknown>;
+}
+
+type V2SessionCallback = (event: V2SessionEvent) => Promise<void> | void;
+type V2ToolCallback = (event: V2ToolEvent) => Promise<void> | void;
+
+function v2UserTurn(text: string): V2Message {
+  return { role: "user", content: [{ type: "text", text }] };
+}
+
+function v2Event(
+  messages: V2Message[],
+  opts: { agent?: string; sessionID?: string } = {},
+): V2SessionEvent {
+  return {
+    sessionID: opts.sessionID ?? "ses_v2",
+    agent: opts.agent ?? "build",
+    messages,
+  };
+}
+
+async function captureV2SessionHook(
+  plugin: { setup: (ctx: unknown) => Promise<void> },
+  directory: string,
+): Promise<Record<string, V2SessionCallback>> {
+  const captured: Record<string, V2SessionCallback> = {};
+  await plugin.setup({
+    location: { directory },
+    session: {
+      hook: async (name: string, callback: V2SessionCallback) => {
+        captured[name] = callback;
+      },
+    },
+  });
+  return captured;
+}
+
+async function captureV2ToolHook(
+  plugin: { setup: (ctx: unknown) => Promise<void> },
+  directory: string,
+): Promise<Record<string, V2ToolCallback>> {
+  const captured: Record<string, V2ToolCallback> = {};
+  await plugin.setup({
+    location: { directory },
+    tool: {
+      hook: async (name: string, callback: V2ToolCallback) => {
+        captured[name] = callback;
+      },
+    },
+  });
+  return captured;
+}
+
+describe("opencode dual entrypoint export shape", () => {
+  it("exports id, server() and setup() from every plugin", () => {
+    for (const plugin of [
+      sessionStartPlugin,
+      injectWorkflowStatePlugin,
+      injectSubagentContextPlugin,
+    ]) {
+      expect(typeof plugin.id).toBe("string");
+      expect(plugin.id.length).toBeGreaterThan(0);
+      expect(typeof plugin.server).toBe("function");
+      expect(typeof plugin.setup).toBe("function");
+    }
+  });
+
+  it("registers distinct plugin ids", () => {
+    const ids = [
+      sessionStartPlugin.id,
+      injectWorkflowStatePlugin.id,
+      injectSubagentContextPlugin.id,
+    ];
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+});
+
+describe("opencode v2 session context hook", () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = setupTrellisProject();
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("injects session context onto the latest user message without mutating it", async () => {
+    const hooks = await captureV2SessionHook(sessionStartPlugin, dir);
+    expect(Object.keys(hooks)).toEqual(["context"]);
+
+    const latest = v2UserTurn("First request");
+    const event = v2Event([latest]);
+    await hooks["context"]?.(event);
+
+    expect(event.messages[0]).not.toBe(latest);
+    expect(latest.content).toEqual([{ type: "text", text: "First request" }]);
+    const injected = event.messages[0].content as V2ContentPart[];
+    expect(injected[0]).toMatchObject({
+      type: "text",
+      metadata: { trellis: { sessionStart: true } },
+    });
+    expect(injected[0].text).toMatch(/^<session-context>/);
+    expect(injected[0].text).toContain("<first-reply-notice>");
+    expect(injected[1]).toEqual({ type: "text", text: "First request" });
+  });
+
+  it("strips the first-reply notice once an assistant message exists", async () => {
+    const hooks = await captureV2SessionHook(sessionStartPlugin, dir);
+    const event = v2Event([
+      { role: "user", content: [{ type: "text", text: "earlier" }] },
+      { role: "assistant", content: [{ type: "text", text: "reply" }] },
+      v2UserTurn("Follow-up"),
+    ]);
+    await hooks["context"]?.(event);
+
+    const injected = (event.messages[2].content as V2ContentPart[])[0];
+    expect(injected.text).toMatch(/^<session-context>/);
+    expect(injected.text).not.toContain("<first-reply-notice>");
+  });
+
+  it("converts a plain-string user content into parts", async () => {
+    const hooks = await captureV2SessionHook(sessionStartPlugin, dir);
+    const event = v2Event([{ role: "user", content: "plain prompt" }]);
+    await hooks["context"]?.(event);
+
+    const injected = event.messages[0].content as V2ContentPart[];
+    expect(injected[0].text).toMatch(/^<session-context>/);
+    expect(injected[1]).toEqual({ type: "text", text: "plain prompt" });
+  });
+
+  it("skips trellis sub-agent turns and env-gated turns", async () => {
+    const hooks = await captureV2SessionHook(sessionStartPlugin, dir);
+
+    for (const agent of ["trellis-implement", "trellis-check", "trellis-research"]) {
+      const latest = v2UserTurn("untouched");
+      const event = v2Event([latest], { agent });
+      await hooks["context"]?.(event);
+      expect(event.messages[0]).toBe(latest);
+    }
+
+    const cases = [
+      ["TRELLIS_HOOKS", "0"],
+      ["TRELLIS_DISABLE_HOOKS", "1"],
+      ["OPENCODE_NON_INTERACTIVE", "1"],
+    ] as const;
+    for (const [key, value] of cases) {
+      const previous = process.env[key];
+      process.env[key] = value;
+      try {
+        const latest = v2UserTurn("untouched");
+        const event = v2Event([latest]);
+        await hooks["context"]?.(event);
+        expect(event.messages[0]).toBe(latest);
+      } finally {
+        if (previous === undefined) Reflect.deleteProperty(process.env, key);
+        else process.env[key] = previous;
+      }
+    }
+  });
+
+  it("injects the workflow-state breadcrumb for the main session", async () => {
+    writeSessionFile(dir, "opencode_sole", ".trellis/tasks/demo-task");
+    writeFileSync(
+      join(dir, ".trellis", "tasks", "demo-task", "task.json"),
+      JSON.stringify({ id: "demo-task", status: "in_progress" }),
+    );
+    const hooks = await captureV2SessionHook(injectWorkflowStatePlugin, dir);
+
+    const latest = v2UserTurn("keep going");
+    const event = v2Event([latest]);
+    await hooks["context"]?.(event);
+
+    expect(event.messages[0]).not.toBe(latest);
+    const injected = (event.messages[0].content as V2ContentPart[])[0];
+    expect(injected.text).toContain("<workflow-state>");
+    expect(injected.text).toContain("Task: demo-task (in_progress)");
+    expect(injected.metadata).toEqual({ trellis: { workflowState: true } });
+  });
+
+  it("workflow-state skips on the skip keyword and sub-agent turns", async () => {
+    const hooks = await captureV2SessionHook(injectWorkflowStatePlugin, dir);
+
+    const skipped = v2UserTurn("no-trellis explain this regex");
+    const skippedEvent = v2Event([skipped]);
+    await hooks["context"]?.(skippedEvent);
+    expect(skippedEvent.messages[0]).toBe(skipped);
+
+    const subagent = v2UserTurn("sub prompt");
+    const subagentEvent = v2Event([subagent], { agent: "trellis-implement" });
+    await hooks["context"]?.(subagentEvent);
+    expect(subagentEvent.messages[0]).toBe(subagent);
+  });
+
+  it("workflow-state checks the skip keyword only in ordinary user text", async () => {
+    const hooks = await captureV2SessionHook(injectWorkflowStatePlugin, dir);
+    const latest: V2Message = {
+      role: "user",
+      content: [
+        {
+          type: "text",
+          text: "machine context containing no-trellis",
+          metadata: { trellis: { sessionStart: true } },
+        },
+        { type: "text", text: "ordinary prompt" },
+      ],
+    };
+    const event = v2Event([latest]);
+    await hooks["context"]?.(event);
+
+    const injected = (event.messages[0].content as V2ContentPart[])[0];
+    expect(injected.text).toContain("<workflow-state>");
+    expect((event.messages[0].content as V2ContentPart[]).at(-1)).toEqual({
+      type: "text",
+      text: "ordinary prompt",
+    });
+  });
+
+  it("stacks both plugins in either order with the user text preserved", async () => {
+    const sessionHooks = await captureV2SessionHook(sessionStartPlugin, dir);
+    const workflowHooks = await captureV2SessionHook(injectWorkflowStatePlugin, dir);
+    const sessionContext = sessionHooks["context"];
+    const workflowContext = workflowHooks["context"];
+    expect(sessionContext).toBeTypeOf("function");
+    expect(workflowContext).toBeTypeOf("function");
+    if (!sessionContext || !workflowContext) return;
+
+    for (const order of [
+      [sessionContext, workflowContext],
+      [workflowContext, sessionContext],
+    ]) {
+      const latest = v2UserTurn("ordinary prompt");
+      const event = v2Event([latest]);
+      for (const callback of order) await callback(event);
+
+      const parts = event.messages[0].content as V2ContentPart[];
+      const trellisTexts = parts.filter(part => part.metadata?.trellis);
+      expect(trellisTexts.some(part => part.text?.startsWith("<session-context>"))).toBe(true);
+      expect(trellisTexts.some(part => part.text?.startsWith("<workflow-state>"))).toBe(true);
+      expect(parts.at(-1)).toEqual({ type: "text", text: "ordinary prompt" });
+      expect(latest.content).toEqual([{ type: "text", text: "ordinary prompt" }]);
+    }
+  });
+});
+
+describe("opencode v2 tool execute.before hook", () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = setupTrellisProject();
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("registers on execute.before and injects the task prompt in place", async () => {
+    const hooks = await captureV2ToolHook(injectSubagentContextPlugin, dir);
+    expect(Object.keys(hooks)).toEqual(["execute.before"]);
+
+    writeSessionFile(dir, "opencode_sole", ".trellis/tasks/demo-task");
+    // Released v2 (checked against v2.0.15 source) names the tool "subagent"
+    // and selects the agent via `agent`, not `subagent_type`.
+    const event: V2ToolEvent = {
+      tool: "subagent",
+      sessionID: "stranger",
+      agent: "build",
+      input: {
+        agent: "trellis-implement",
+        prompt: "do the implementation",
+      },
+    };
+    await hooks["execute.before"]?.(event);
+
+    expect(event.input?.prompt).toContain("<!-- trellis-hook-injected -->");
+    expect(event.input?.prompt).toContain("# Implement Agent Task");
+    expect(event.input?.prompt).toContain("Demo PRD");
+    expect((event.input?.prompt as string).startsWith("<!-- trellis-hook-injected -->")).toBe(true);
+  });
+
+  it("prefixes shell commands with the session context id", async () => {
+    const hooks = await captureV2ToolHook(injectSubagentContextPlugin, dir);
+    const event: V2ToolEvent = {
+      tool: "shell",
+      sessionID: "oc-v2",
+      agent: "build",
+      input: { command: "python3 ./.trellis/scripts/task.py current" },
+    };
+    await hooks["execute.before"]?.(event);
+
+    expect(event.input?.command).toBe(
+      "export TRELLIS_CONTEXT_ID='opencode_oc-v2'; python3 ./.trellis/scripts/task.py current",
+    );
+  });
+
+  it("still accepts the v1 tool names and selector field on the v2 transport", async () => {
+    const hooks = await captureV2ToolHook(injectSubagentContextPlugin, dir);
+    writeSessionFile(dir, "opencode_sole", ".trellis/tasks/demo-task");
+
+    const bashEvent: V2ToolEvent = {
+      tool: "bash",
+      sessionID: "oc-v2",
+      input: { command: "git status --short" },
+    };
+    await hooks["execute.before"]?.(bashEvent);
+    expect(bashEvent.input?.command).toBe(
+      "export TRELLIS_CONTEXT_ID='opencode_oc-v2'; git status --short",
+    );
+
+    const taskEvent: V2ToolEvent = {
+      tool: "task",
+      sessionID: "stranger",
+      input: {
+        subagent_type: "trellis-implement",
+        prompt: "do the implementation",
+      },
+    };
+    await hooks["execute.before"]?.(taskEvent);
+    expect(taskEvent.input?.prompt).toContain("<!-- trellis-hook-injected -->");
+  });
+
+  it("strips a namespace prefix from the v2 agent selector", async () => {
+    const hooks = await captureV2ToolHook(injectSubagentContextPlugin, dir);
+    writeSessionFile(dir, "opencode_sole", ".trellis/tasks/demo-task");
+
+    const event: V2ToolEvent = {
+      tool: "subagent",
+      sessionID: "stranger",
+      input: {
+        agent: "project/trellis-implement",
+        prompt: "do the implementation",
+      },
+    };
+    await hooks["execute.before"]?.(event);
+
+    expect(event.input?.prompt).toContain("<!-- trellis-hook-injected -->");
+    expect(event.input?.prompt).toContain("# Implement Agent Task");
+  });
+
+  it("ignores non-object tool input and unrelated tools", async () => {
+    const hooks = await captureV2ToolHook(injectSubagentContextPlugin, dir);
+
+    await hooks["execute.before"]?.({ tool: "shell" });
+    const readEvent: V2ToolEvent = {
+      tool: "read",
+      sessionID: "oc-v2",
+      input: { filePath: "README.md" },
+    };
+    await hooks["execute.before"]?.(readEvent);
+    expect(readEvent.input).toEqual({ filePath: "README.md" });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Issue #441 — sub-agent context injection limits
 // ---------------------------------------------------------------------------
 
@@ -1286,7 +1665,7 @@ describe("opencode context injection limits (issue #441)", () => {
 
   async function runImplementHook(): Promise<string> {
     writeSessionFile(dir, "opencode_sole", ".trellis/tasks/demo-task");
-    const hooks = (await injectSubagentContextPlugin({
+    const hooks = (await injectSubagentContextPlugin.server({
       directory: dir,
       platform: "linux",
       env: {},

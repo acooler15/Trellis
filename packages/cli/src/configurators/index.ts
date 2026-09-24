@@ -24,7 +24,7 @@ import { loadHashes } from "../utils/template-hash.js";
 // what its platform installs, and lives next to any residual behavior.
 import { collectClaudeTemplates, configureClaude } from "./claude.js";
 import { collectCursorTemplates } from "./cursor.js";
-import { collectOpenCodeTemplates } from "./opencode.js";
+import { collectOpenCodeTemplates, configureOpenCode } from "./opencode.js";
 import { collectCodexTemplates, configureCodex } from "./codex.js";
 import { collectKiloTemplates } from "./kilo.js";
 import { collectKiroTemplates } from "./kiro.js";
@@ -69,9 +69,9 @@ interface PlatformFunctions {
  * described once and `trellis init` and `trellis update` cannot disagree
  * about it.
  *
- * The three platforms that also do something a `Map<path, content>` cannot
- * express (claude-code, codex, zcode) spell out both fields and keep that
- * behavior inline in their own configurator.
+ * The four platforms that also do something a `Map<path, content>` cannot
+ * express (claude-code, codex, zcode, opencode) spell out both fields and keep
+ * that behavior inline in their own configurator.
  */
 function fromTemplates(
   collectTemplates: () => Map<string, string>,
@@ -88,7 +88,10 @@ const PLATFORM_FUNCTIONS: Record<AITool, PlatformFunctions> = {
     collectTemplates: collectClaudeTemplates,
   },
   cursor: fromTemplates(collectCursorTemplates),
-  opencode: fromTemplates(collectOpenCodeTemplates),
+  opencode: {
+    configure: configureOpenCode,
+    collectTemplates: collectOpenCodeTemplates,
+  },
   codex: { configure: configureCodex, collectTemplates: collectCodexTemplates },
   kilo: fromTemplates(collectKiloTemplates),
   kiro: fromTemplates(collectKiroTemplates),

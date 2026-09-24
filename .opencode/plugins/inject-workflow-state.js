@@ -5,15 +5,20 @@
  * Per-turn UserPromptSubmit equivalent for OpenCode.
  *
  * On every model request, inject a short <workflow-state> breadcrumb
- * into the in-memory copy of the latest user message via
- * `experimental.chat.messages.transform`. Stored history and the TUI
- * are not modified (issue #553). Breadcrumb text is pulled exclusively
- * from the project's workflow.md [workflow-state:STATUS] tag blocks —
- * workflow.md is the single source of truth. There are no fallback
- * tables in this plugin: when workflow.md is missing or a tag is
+ * into the in-memory copy of the latest user message. Stored history and
+ * the TUI are not modified (issue #553). Breadcrumb text is pulled
+ * exclusively from the project's workflow.md [workflow-state:STATUS] tag
+ * blocks — workflow.md is the single source of truth. There are no
+ * fallback tables in this plugin: when workflow.md is missing or a tag is
  * absent, the breadcrumb degrades to a generic
  * "Refer to workflow.md for current step." line so users see (and fix)
  * the broken state instead of the plugin silently masking it.
+ *
+ * Dual OpenCode entrypoint (v1 >= 1.18.29 and v2), same layout as
+ * session-start.js: v1 calls `server()` for the
+ * `experimental.chat.messages.transform` hook, v2 calls `setup(ctx)` and
+ * registers `ctx.session.hook("context")`. The v2 `compaction` hook is
+ * not registered — the breadcrumb orients agent replies only.
  *
  * Silently skips when:
  *   - No .trellis/ directory
@@ -26,8 +31,10 @@ import { join } from "path"
 import {
   MESSAGES_TRANSFORM_HOOK,
   latestUserPromptText,
+  latestUserPromptTextV2,
   platformInputFromMessages,
   prependEphemeralText,
+  prependEphemeralTextV2,
 } from "../lib/context-visibility.js"
 import { TrellisContext, debugLog, isTrellisSubagent } from "../lib/trellis-context.js"
 
@@ -178,12 +185,23 @@ function buildBreadcrumb(id, status, templates) {
   return `<workflow-state>\n${header}\n${body}\n</workflow-state>`
 }
 
-// OpenCode 1.2.x expects plugins to be factory functions (see inject-subagent-context.js comment).
-export default async ({ directory }) => {
-  const ctx = new TrellisContext(directory)
-  debugLog("workflow-state", "Plugin loaded, directory:", directory)
+function hooksDisabled() {
+  return (
+    process.env.TRELLIS_HOOKS === "0" ||
+    process.env.TRELLIS_DISABLE_HOOKS === "1" ||
+    process.env.OPENCODE_NON_INTERACTIVE === "1"
+  )
+}
 
-  return {
+export default {
+  id: "trellis-workflow-state",
+
+  // OpenCode v1 (>= 1.18.29): `server()` returns the v1 hook map.
+  async server({ directory }) {
+    const ctx = new TrellisContext(directory)
+    debugLog("workflow-state", "Plugin loaded (v1 server), directory:", directory)
+
+    return {
       [MESSAGES_TRANSFORM_HOOK]: async (_input, output) => {
         try {
           const messages = output?.messages
@@ -195,10 +213,7 @@ export default async ({ directory }) => {
             debugLog("workflow-state", "Skipping trellis subagent turn:", platformInput?.agent)
             return
           }
-          if (process.env.TRELLIS_HOOKS === "0" || process.env.TRELLIS_DISABLE_HOOKS === "1") {
-            return
-          }
-          if (process.env.OPENCODE_NON_INTERACTIVE === "1") {
+          if (hooksDisabled()) {
             return
           }
           if (!ctx.isTrellisProject()) {
@@ -236,5 +251,63 @@ export default async ({ directory }) => {
           )
         }
       },
-  }
+    }
+  },
+
+  // OpenCode v2: `setup(ctx)` registers the domain-hook equivalent.
+  // v1 >= 1.18.29 also calls `setup()` through its v2 compat host, but that
+  // PluginContext carries only options/agent/aisdk/catalog/command/
+  // integration/plugin/reference/skill — no location and no session domain.
+  // Stand down there: v1 already injected through `server()`.
+  async setup(pluginCtx) {
+    const directory = pluginCtx?.location?.directory
+    if (!directory || !pluginCtx?.session?.hook) {
+      debugLog("workflow-state", "setup() skipped: host has no location/session domain (v1 compat host)")
+      return
+    }
+    const ctx = new TrellisContext(directory)
+    debugLog("workflow-state", "Plugin loaded (v2 setup), directory:", directory)
+
+    await pluginCtx.session.hook("context", (event) => {
+      try {
+        if (isTrellisSubagent(event)) {
+          debugLog("workflow-state", "Skipping trellis subagent turn:", event?.agent)
+          return
+        }
+        if (hooksDisabled()) {
+          return
+        }
+        if (!ctx.isTrellisProject()) {
+          return
+        }
+
+        const originalText = latestUserPromptTextV2(event?.messages)
+        if (promptHasSkipKeyword(originalText, readSkipKeyword(directory))) {
+          debugLog("workflow-state", "Skipping turn: skip keyword present in prompt")
+          return
+        }
+
+        const templates = loadBreadcrumbs(directory)
+        const task = getActiveTask(ctx, { sessionID: event?.sessionID, agent: event?.agent })
+        const breadcrumb = task
+          ? buildBreadcrumb(task.id, task.status, templates, task.source)
+          : buildBreadcrumb(null, "no_task", templates)
+
+        prependEphemeralTextV2(event?.messages, breadcrumb, "workflowState")
+        debugLog(
+          "workflow-state",
+          "Injected breadcrumb for task",
+          task ? task.id : "none",
+          "status",
+          task ? task.status : "no_task",
+        )
+      } catch (error) {
+        debugLog(
+          "workflow-state",
+          "Error in session context hook:",
+          error instanceof Error ? error.message : String(error),
+        )
+      }
+    })
+  },
 }

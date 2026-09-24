@@ -146,3 +146,80 @@ export function prependEphemeralText(messages, text) {
   }
   return true
 }
+
+// ============================================================
+// OpenCode 2.x request-message helpers
+//
+// v1 `experimental.chat.messages.transform` passed `{info, parts}[]`
+// transcript rows. v2 replaced it with `ctx.session.hook("context")`
+// whose `event.messages` are flat `{role, content: Part[]}[]` request
+// messages (`Message` from @opencode/ai). The helpers above keep
+// serving the v1 path; these serve the v2 path. Hook mutations affect
+// only the outgoing model request, never stored history, so the v2
+// injected parts are marked via `metadata.trellis` instead of the v1
+// `synthetic` flag — the marker lets a sibling Trellis plugin tell an
+// injected part from the user's own text regardless of hook order.
+// ============================================================
+
+/** True when the part was injected by a Trellis plugin on this request. */
+function isTrellisInjectedPartV2(part) {
+  const trellis = part?.metadata?.trellis
+  return Boolean(trellis && typeof trellis === "object")
+}
+
+/** Index of the last `{role, content}` user request message. */
+export function findLatestUserMessageIndexV2(messages) {
+  if (!Array.isArray(messages)) return -1
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]?.role === "user") return i
+  }
+  return -1
+}
+
+/** Concatenated ordinary user text of the latest user request message. */
+export function latestUserPromptTextV2(messages) {
+  const index = findLatestUserMessageIndexV2(messages)
+  if (index < 0) return ""
+  const content = messages[index].content
+  if (typeof content === "string") return content
+  if (!Array.isArray(content)) return ""
+  return content
+    .filter(part => part?.type === "text" && !isTrellisInjectedPartV2(part))
+    .map(part => (typeof part.text === "string" ? part.text : ""))
+    .filter(text => text !== "")
+    .join("\n\n")
+}
+
+/** True once the request carries any assistant message (v1 parity gate). */
+export function transcriptHasAssistantMessageV2(messages) {
+  if (!Array.isArray(messages)) return false
+  return messages.some(message => message?.role === "assistant")
+}
+
+/**
+ * Slot-replace the latest user request message with a clone whose content
+ * carries the Trellis text part first. The original message object and its
+ * `content` array are never mutated, mirroring the v1 ephemeral contract.
+ */
+export function prependEphemeralTextV2(messages, text, kind) {
+  if (!Array.isArray(messages)) return false
+  if (typeof text !== "string") return false
+  const index = findLatestUserMessageIndexV2(messages)
+  if (index < 0) return false
+  const original = messages[index]
+  const content = typeof original.content === "string"
+    ? [{ type: "text", text: original.content }]
+    : Array.isArray(original.content)
+      ? original.content.slice()
+      : []
+  content.unshift({
+    type: "text",
+    text,
+    metadata: { trellis: { [kind]: true } },
+  })
+  messages[index] = {
+    ...original,
+    content,
+  }
+  return true
+}

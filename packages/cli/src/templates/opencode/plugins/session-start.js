@@ -3,9 +3,18 @@
  * Trellis Session Start Plugin
  *
  * Injects compact SessionStart context into the copy of the latest user
- * message that OpenCode sends to the model. Uses
- * `experimental.chat.messages.transform` so TUI / Web / SQLite history
+ * message that OpenCode sends to the model, so TUI / Web / SQLite history
  * stay untouched (issue #553).
+ *
+ * Dual OpenCode entrypoint (v1 >= 1.18.29 and v2):
+ *   - v1 calls `server()` and merges the returned hook map.
+ *   - v2 calls `setup(ctx)` and registers through domain hooks.
+ * Both read the same injection core below; only the transport differs:
+ *   v1 `experimental.chat.messages.transform` ({info, parts}[] transcript)
+ *   v2 `ctx.session.hook("context")` ({role, content}[] request messages)
+ * The v2 `compaction` hook is deliberately NOT registered: v1 fired the
+ * transform on compaction too, but the session context exists to orient
+ * agent replies, not compaction summaries.
  */
 
 import { TrellisContext, debugLog, isTrellisSubagent } from "../lib/trellis-context.js"
@@ -13,7 +22,9 @@ import {
   MESSAGES_TRANSFORM_HOOK,
   platformInputFromMessages,
   prependEphemeralText,
+  prependEphemeralTextV2,
   transcriptHasAssistantMessage,
+  transcriptHasAssistantMessageV2,
 } from "../lib/context-visibility.js"
 import { buildSessionContext } from "../lib/session-utils.js"
 
@@ -23,43 +34,95 @@ function stripFirstReplyNotice(context) {
   return context.replace(FIRST_REPLY_NOTICE_RE, "")
 }
 
-// OpenCode 1.2.x expects plugins to be factory functions (see inject-subagent-context.js comment).
-export default async ({ directory }) => {
-  const ctx = new TrellisContext(directory)
-  debugLog("session", "Plugin loaded, directory:", directory)
+function hooksDisabled() {
+  return (
+    process.env.TRELLIS_HOOKS === "0" ||
+    process.env.TRELLIS_DISABLE_HOOKS === "1" ||
+    process.env.OPENCODE_NON_INTERACTIVE === "1"
+  )
+}
 
-  return {
-    [MESSAGES_TRANSFORM_HOOK]: async (_input, output) => {
+export default {
+  id: "trellis-session-start",
+
+  // OpenCode v1 (>= 1.18.29): `server()` returns the v1 hook map.
+  async server({ directory }) {
+    const ctx = new TrellisContext(directory)
+    debugLog("session", "Plugin loaded (v1 server), directory:", directory)
+
+    return {
+      [MESSAGES_TRANSFORM_HOOK]: async (_input, output) => {
+        try {
+          const messages = output?.messages
+          const platformInput = platformInputFromMessages(messages)
+          const agent = platformInput?.agent || "unknown"
+          debugLog("session", "messages.transform called, agent:", agent)
+
+          if (isTrellisSubagent(platformInput)) {
+            debugLog("session", "Skipping trellis subagent turn:", agent)
+            return
+          }
+
+          if (hooksDisabled()) {
+            debugLog("session", "Skipping - hooks disabled")
+            return
+          }
+
+          let context = buildSessionContext(ctx, platformInput)
+          if (transcriptHasAssistantMessage(messages)) {
+            context = stripFirstReplyNotice(context)
+          }
+          debugLog("session", "Built context, length:", context.length)
+          prependEphemeralText(messages, context)
+        } catch (error) {
+          debugLog("session", "Error in messages.transform:", error.message, error.stack)
+        }
+      },
+    }
+  },
+
+  // OpenCode v2: `setup(ctx)` registers the domain-hook equivalent.
+  //
+  // v1 >= 1.18.29 also ships a v2 compat host (core/src/plugin/promise.ts)
+  // that calls `setup()` on the same module, but its PluginContext carries
+  // only agent/aisdk/catalog/command/integration/plugin/reference/skill —
+  // no `location` and no `session` domain. Detect that shape and stand
+  // down: v1 already injected through `server()`, so registering here would
+  // at best duplicate and at worst throw inside the host.
+  async setup(pluginCtx) {
+    const directory = pluginCtx?.location?.directory
+    if (!directory || !pluginCtx?.session?.hook) {
+      debugLog("session", "setup() skipped: host has no location/session domain (v1 compat host)")
+      return
+    }
+    const ctx = new TrellisContext(directory)
+    debugLog("session", "Plugin loaded (v2 setup), directory:", directory)
+
+    await pluginCtx.session.hook("context", (event) => {
       try {
-        const messages = output?.messages
-        const platformInput = platformInputFromMessages(messages)
-        const agent = platformInput?.agent || "unknown"
-        debugLog("session", "messages.transform called, agent:", agent)
+        const agent = event?.agent || "unknown"
+        debugLog("session", "session context hook called, agent:", agent)
 
-        if (isTrellisSubagent(platformInput)) {
+        if (isTrellisSubagent(event)) {
           debugLog("session", "Skipping trellis subagent turn:", agent)
           return
         }
 
-        if (process.env.TRELLIS_HOOKS === "0" || process.env.TRELLIS_DISABLE_HOOKS === "1") {
-          debugLog("session", "Skipping - TRELLIS_HOOKS disabled")
+        if (hooksDisabled()) {
+          debugLog("session", "Skipping - hooks disabled")
           return
         }
 
-        if (process.env.OPENCODE_NON_INTERACTIVE === "1") {
-          debugLog("session", "Skipping - non-interactive mode")
-          return
-        }
-
+        const platformInput = { sessionID: event?.sessionID, agent: event?.agent }
         let context = buildSessionContext(ctx, platformInput)
-        if (transcriptHasAssistantMessage(messages)) {
+        if (transcriptHasAssistantMessageV2(event?.messages)) {
           context = stripFirstReplyNotice(context)
         }
         debugLog("session", "Built context, length:", context.length)
-        prependEphemeralText(messages, context)
+        prependEphemeralTextV2(event?.messages, context, "sessionStart")
       } catch (error) {
-        debugLog("session", "Error in messages.transform:", error.message, error.stack)
+        debugLog("session", "Error in session context hook:", error.message, error.stack)
       }
-    },
-  }
+    })
+  },
 }

@@ -16,7 +16,7 @@ Most files Trellis writes are opaque (`.py`, `.md`, `.ts`) — `trellis uninstal
 |------|----------------|
 | `.claude/settings.json` | Trellis writes the `hooks` block and may opt in its status-line command; user may have set `env`, `model`, `permissions`, `version`, or another status line |
 | `.cursor/hooks.json` | Same idea, but a flat schema |
-| `.opencode/package.json` | Trellis adds `dependencies["@opencode-ai/plugin"]`; user may have other deps |
+| `.opencode/package.json` | Older Trellis versions added `dependencies["@opencode-ai/plugin"]`; the template dep was dropped (plugins are dependency-free plain JS) but the scrubber keeps cleaning installs that still carry it; user may have other deps |
 | `.pi/settings.json` | Trellis adds `enableSkillCommands` plus entries in `extensions`/`skills`/`prompts` arrays; user may have entries of their own |
 | `.codex/config.toml` | Trellis writes documented fallback/hook settings, template comments, and `[agents].max_depth = 1`; user may have added more TOML directives or other `[agents]` keys |
 | `.codex/hooks.json`, `.gemini/settings.json`, `.factory/settings.json`, `.codebuddy/settings.json`, `.qoder/settings.json`, `.github/copilot/hooks.json` | Same hooks-block pattern as `.claude/settings.json` (sometimes flat, sometimes nested) |

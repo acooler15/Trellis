@@ -118,14 +118,31 @@ Both regexes MUST use the `\1` backreference variant — `[workflow-state:([A-Za
 ### 1. Scope / Trigger
 
 OpenCode SessionStart and per-turn workflow-state plugins inject Trellis
-context through `experimental.chat.messages.transform`. That hook runs on
-the in-memory transcript OpenCode is about to convert to model messages
-(`SessionPrompt.run` and compaction). It does not write SQLite / TUI /
-Web history. `chat.message` remains the persist path and must not be used
-for Trellis context (issue #553, replacing the persisted-synthetic-part
-contract from #524).
+context into the in-memory copy of the transcript OpenCode is about to
+convert to model messages. It does not write SQLite / TUI / Web history.
+`chat.message` remains the persist path and must not be used for Trellis
+context (issue #553, replacing the persisted-synthetic-part contract from
+#524).
+
+The plugins ship one dual entrypoint for both OpenCode majors
+(`packages/cli/src/templates/opencode/plugins/*.js`):
+
+- **v1 (>= 1.18.29)**: `server({directory})` returns the v1 hook map;
+  injection rides `experimental.chat.messages.transform`, which runs in
+  `SessionPrompt.run` and compaction. The v1 object entrypoint is why
+  1.18.29 is the minimum supported v1 — older 1.x only invoked function
+  exports and would throw on the object shape.
+- **v2**: `setup(ctx)` registers `ctx.session.hook("context")`, the
+  documented replacement for `experimental.chat.messages.transform`.
+  The v2 `compaction` hook is intentionally NOT registered: the injected
+  context orients agent replies, not compaction summaries.
+
+Local file plugins must export a stable `id` on the default export for
+both majors (v1 `resolvePluginId` throws for id-less path plugins).
 
 ### 2. Signatures
+
+v1 path (lib/context-visibility.js):
 
 - `findLatestUserMessageIndex(messages) -> number`
 - `latestUserPromptText(messages) -> string`
@@ -135,24 +152,44 @@ contract from #524).
 - Hook input from OpenCode is `{}`; session identity is read from the
   latest user message `info`.
 
+v2 path (same lib):
+
+- `findLatestUserMessageIndexV2(messages) -> number`
+- `latestUserPromptTextV2(messages) -> string`
+- `transcriptHasAssistantMessageV2(messages) -> boolean`
+- `prependEphemeralTextV2(messages, text, kind) -> boolean`
+- Hook: `ctx.session.hook("context", (event) => ...)`; session identity
+  comes from `event.sessionID` / `event.agent` — no message parsing.
+- v2 messages are flat `{role, content: Part[]}[]` (`Message` from
+  `@opencode/ai`), NOT the v1 `{info, parts}[]` transcript rows.
+
 ### 3. Contracts
 
-- Only the latest `info.role === "user"` message is cloned. Earlier user
-  and assistant messages stay the original object references.
-- The clone prepends `{ type: "text", text, synthetic: true }` parts.
-  Ordinary parts on the clone keep their original objects; the original
-  message's `parts` array is not mutated.
-- Injection does not require a persisted `prt_...` identity. Attachment-only
-  latest user messages still receive the ephemeral text parts.
+- Only the latest user message is cloned. Earlier user and assistant
+  messages stay the original object references. v2 replaces the array
+  slot with the clone; the original message and its `parts`/`content`
+  arrays are never mutated.
+- The clone prepends an ephemeral text part: v1
+  `{ type: "text", text, synthetic: true }`, v2
+  `{ type: "text", text, metadata: { trellis: { <kind>: true } } }` with
+  kind `sessionStart` / `workflowState`. The v2 marker replaces the v1
+  `synthetic` flag so sibling Trellis plugins can tell injected parts
+  from the user's own text regardless of hook order.
+- Injection does not require a persisted `prt_...` identity (v1) or any
+  persisted marker (v2 hook mutations never reach storage).
+  Attachment-only latest user messages still receive the ephemeral text
+  parts.
 - Workflow-state checks the skip keyword only against ordinary user text
-  (`findUserTextPart`), never against ephemeral or stored synthetic parts.
+  (v1 `findUserTextPart`, v2 parts without a `metadata.trellis` marker),
+  never against ephemeral or injected parts.
 - SessionStart injects rebuilt compact context onto the latest user message
   every model call. `<first-reply-notice>` is included only when the
   transcript has no assistant message.
-- Plugin error handling leaves `output.messages` unchanged (prepend is the
+- Plugin error handling leaves the message list unchanged (prepend is the
   last step).
-- Trellis sub-agent turns (`info.agent` matching `trellis-implement` /
-  `trellis-check` / `trellis-research`) skip both plugins.
+- Trellis sub-agent turns (`agent` matching `trellis-implement` /
+  `trellis-check` / `trellis-research`, optionally behind a namespace
+  prefix for v2 scoped Agent IDs) skip both plugins.
 
 ### 4. Validation & Error Matrix
 

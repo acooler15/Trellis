@@ -414,8 +414,10 @@ Cursor IDE may send `transcript_path: null`; this must not prevent session
 scoping when `session_id` or `conversation_id` is present.
 
 OpenCode has **no** entry in any env table. Its plugin holds the session
-identity and injects it, so the plugin must prefix Bash tool commands in
-`tool.execute.before` with a shell-aware `TRELLIS_CONTEXT_ID` assignment when
+identity and injects it, so the plugin must prefix shell commands in
+`tool.execute.before` (v1 hook map; v2 registers the same handler via
+`ctx.tool.hook("execute.before")` and mutates `event.input.command`) with a
+shell-aware `TRELLIS_CONTEXT_ID` assignment when
 the command does not already set one: POSIX shells use
 `export TRELLIS_CONTEXT_ID=<context-key>;`, while Windows PowerShell uses
 `$env:TRELLIS_CONTEXT_ID = '<context-key>';`. That prefix is the only channel
@@ -1157,31 +1159,43 @@ Platform's native sub-agent-start hook delivers context before the child runs. M
 | Cursor        | `preToolUse` + matcher `Task          | Subagent`                               | `updated_input.prompt` (Cursor staff marked Task prompt mutation fixed on 2026-04-07; current Cursor may emit native sub-agent calls as tool name `Subagent`, and native Task args may encode custom agents as `subagent_type.custom.name`) |
 | Factory Droid | `PreToolUse` + matcher `Task`         | `updatedInput.prompt`                   |
 | Kiro          | per-agent `agentSpawn` hook           | direct stdout context                   |
-| OpenCode      | JS plugin `tool.execute.before`       | `args.prompt` mutation                  |
+| OpenCode      | JS plugin `tool.execute.before` (v1) / `ctx.tool.hook("execute.before")` (v2) | `args.prompt` / `event.input.prompt` mutation |
 | Snow CLI      | `beforeSubAgentStart`                 | own `write-trellis-context.py subagent` (Snow bundles all three inject hooks; it is not in `SHARED_HOOKS_BY_PLATFORM`) |
 | ZCode         | `PreToolUse` + matcher `Agent|Task`   | `hookSpecificOutput.updatedInput.prompt` |
 
 #### OpenCode injection contract (issue #264)
 
-OpenCode is a hybrid class-1 platform: its main session uses `tool.execute.before` for sub-agent prompt mutation, but it also runs separate `chat.message` plugins (`session-start.js`, `inject-workflow-state.js`) that fire for **every** chat turn — including sub-agent child sessions. Without explicit filtering, those plugins inject 30-40KB of main-session SessionStart context into sub-agent turns and drown the parent's intended prompt injection.
+OpenCode is a hybrid class-1 platform: its main session uses `tool.execute.before` for sub-agent prompt mutation, but it also runs per-turn context plugins (`session-start.js`, `inject-workflow-state.js`) that fire for **every** model request — including sub-agent child sessions. Without explicit filtering, those plugins inject 30-40KB of main-session SessionStart context into sub-agent turns and drown the parent's intended prompt injection.
 
-**Required contract** for any OpenCode `chat.message` plugin that mutates `output.parts`:
+Every shipped plugin under `packages/cli/src/templates/opencode/plugins/` exports ONE dual entrypoint covering both OpenCode majors:
+
+```js
+export default {
+  id: "trellis-<name>",          // required by both loaders for path plugins
+  async server(input) { ... },   // v1 (>= 1.18.29): returns the v1 hook map
+  async setup(ctx) { ... },      // v2: registers ctx.tool/ctx.session hooks
+}
+```
+
+v1 calls `server()` and ignores `setup`; v2 calls `setup(ctx)` and ignores `server` (per OpenCode's v1→v2 plugin migration guide). 1.18.29 is the minimum supported v1 because that release added the object entrypoint — older 1.x iterated module exports and invoked each as a function. The v2 session identity comes from `ctx.location.directory`; hook registration auto-disposes on plugin unload.
+
+**Required contract** for any per-turn OpenCode context plugin (v1 `experimental.chat.messages.transform`, v2 `ctx.session.hook("context", ...)`):
 
 ```js
 import { isTrellisSubagent } from "../lib/trellis-context.js"
 
-"chat.message": async (input, output) => {
-  if (isTrellisSubagent(input)) {
-    // input.agent matched /^trellis-(implement|check|research)$/
-    // Sub-agent context is injected by inject-subagent-context.js on the
-    // parent's tool.execute.before — do not double-inject here.
-    return
-  }
-  // ... main-session injection ...
+// v1 hook body — platformInput is parsed from the latest user message info;
+// v2 passes the event, whose agent/sessionID fields are read directly.
+if (isTrellisSubagent(platformInput)) {
+  // input.agent matched /^(?:[A-Za-z0-9_.-]+[/:])?trellis-(implement|check|research)$/
+  // Sub-agent context is injected by inject-subagent-context.js on the
+  // parent's tool.execute.before — do not double-inject here.
+  return
 }
+// ... main-session injection ...
 ```
 
-`isTrellisSubagent()` lives in `lib/trellis-context.js`; the regex matches `trellis-implement` / `trellis-check` / `trellis-research` exactly.
+`isTrellisSubagent()` lives in `lib/trellis-context.js`; the regex matches `trellis-implement` / `trellis-check` / `trellis-research`, optionally behind a namespace separator (`project/trellis-implement`) because OpenCode 2.x Agent IDs may be scoped.
 
 **Sub-agent task resolution order** in `inject-subagent-context.js` `tool.execute.before` (only later steps run when earlier ones miss):
 

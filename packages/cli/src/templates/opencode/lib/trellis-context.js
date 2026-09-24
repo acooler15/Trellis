@@ -64,14 +64,19 @@ function buildContextKey(platformName, kind, value) {
   return safeValue ? `${platformName}_${safeValue}` : `${platformName}_${hashValue(value)}`
 }
 
-// Matches `trellis-implement`, `trellis-check`, `trellis-research` exactly.
-// Used by chat.message plugins to skip injection inside Trellis sub-agent turns.
-const TRELLIS_SUBAGENT_RE = /^trellis-(implement|check|research)$/
+// Matches `trellis-implement`, `trellis-check`, `trellis-research` exactly,
+// optionally behind a namespace separator (`project/trellis-implement`,
+// `org:trellis-implement`) because OpenCode 2.x Agent IDs may be scoped.
+// Used by the per-turn context plugins to skip injection inside Trellis
+// sub-agent turns.
+const TRELLIS_SUBAGENT_RE = /^(?:[A-Za-z0-9_.-]+[/:])?trellis-(implement|check|research)$/
 
 /**
- * Return true when the OpenCode `chat.message` input represents a Trellis
- * sub-agent turn. `input.agent` is set by OpenCode when a Task tool spawns a
- * child session with a custom agent (see `packages/opencode/src/tool/task.ts`).
+ * Return true when the OpenCode chat input represents a Trellis sub-agent
+ * turn. `input.agent` is set by OpenCode when a Task tool spawns a child
+ * session with a custom agent (see `packages/opencode/src/tool/task.ts`).
+ * v1 `messages.transform` passes `{sessionID, agent}`; the v2 session
+ * `context` hook event carries the same `agent` field.
  */
 export function isTrellisSubagent(input) {
   if (!input || typeof input !== "object") return false

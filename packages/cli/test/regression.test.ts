@@ -2186,11 +2186,14 @@ describe("regression: update only configured platforms (beta.16)", () => {
     );
     expect(result.has(".opencode/plugins/session-start.js")).toBe(true);
     expect(result.has(".opencode/plugins/inject-workflow-state.js")).toBe(true);
-    // Plus agents, lib, package.json, at least one command, at least one skill
+    // Plus agents, lib, at least one command, at least one skill. No
+    // package.json ships anymore: the plugins import nothing, so the old
+    // @opencode-ai/plugin dep only added a startup install for dead weight
+    // (and the v2-canonical package name is @opencode/plugin anyway).
     expect(result.has(".opencode/agents/trellis-implement.md")).toBe(true);
     expect(result.has(".opencode/lib/context-visibility.js")).toBe(true);
     expect(result.has(".opencode/lib/trellis-context.js")).toBe(true);
-    expect(result.has(".opencode/package.json")).toBe(true);
+    expect(result.has(".opencode/package.json")).toBe(false);
   });
 
   it("[beta.16] collectPlatformTemplates returns Map for platforms with tracking", () => {
