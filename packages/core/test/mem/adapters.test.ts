@@ -83,6 +83,8 @@ const {
 } = await import("../../src/mem/adapters/opencode.js");
 const { opencodeDataDir, opencodeDbPath, HOME } =
   await import("../../src/mem/internal/paths.js");
+const { COMPACT_BOUNDARY_PREFIX } =
+  await import("../../src/mem/dialogue.js");
 const { piListSessions, piExtractDialogue, piSearch } =
   await import("../../src/mem/adapters/pi.js");
 const {
@@ -1421,6 +1423,34 @@ interface OpencodeFixture {
   omitPartSessionId?: boolean;
   /** Commit these rows to the WAL only, leaving the main file behind. */
   walSessions?: { id: string; title?: string; directory?: string }[];
+  /** OpenCode 2.x `session_v2` rows. Creating any of these (or `v2Messages`)
+   * also creates the `session_v2` / `session_message` tables. */
+  v2Sessions?: {
+    id: string;
+    parent_id?: string | null;
+    title?: string;
+    directory?: string;
+    /** Stored verbatim to document the trap: migrated rows carry the original
+     * 1.x version, so the adapter must never route on it. */
+    version?: string;
+    time_created?: number;
+    time_updated?: number;
+  }[];
+  /** OpenCode 2.x `session_message` rows (text lives inline in `data`). */
+  v2Messages?: {
+    id: string;
+    session_id: string;
+    type: string;
+    seq: number;
+    time_created?: number;
+    data: Record<string, unknown>;
+  }[];
+  /** Create the empty 2.x tables even without v2 rows. */
+  withV2Tables?: boolean;
+  /** Build `session_message` without the `seq` column (contract-failure case). */
+  v2MessageOmitSeq?: boolean;
+  /** Skip the legacy `session` / `message` / `part` tables entirely (pure 2.x store). */
+  omitLegacyTables?: boolean;
   dbPath?: string;
 }
 
@@ -1442,30 +1472,53 @@ for suffix in ("", "-wal", "-shm"):
         os.remove(db_path + suffix)
 db = sqlite3.connect(db_path)
 ${useWal ? 'db.execute("PRAGMA journal_mode=WAL")\ndb.execute("PRAGMA wal_autocheckpoint=0")' : ""}
-db.execute("CREATE TABLE session (id TEXT PRIMARY KEY, parent_id TEXT, title TEXT, ${cwdColumn} TEXT, time_created INTEGER, time_updated INTEGER)")
-db.execute("CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)")
-db.execute("CREATE TABLE part (${partColumns})")
 spec = json.loads(${JSON.stringify(JSON.stringify(spec))})
 message_sessions = {m["id"]: m["session_id"] for m in spec.get("messages", [])}
-for s in spec.get("sessions", []):
-    db.execute(
-        "INSERT INTO session (id,parent_id,title,${cwdColumn},time_created,time_updated) VALUES (?,?,?,?,?,?)",
-        (s["id"], s.get("parent_id"), s.get("title"), s.get("directory"),
-         s.get("time_created", 1000), s.get("time_updated", 2000)))
-for m in spec.get("messages", []):
-    db.execute(
-        "INSERT INTO message (id,session_id,time_created,time_updated,data) VALUES (?,?,?,?,?)",
-        (m["id"], m["session_id"], m["time_created"], m["time_created"],
-         json.dumps({"role": m["role"]})))
-for i, p in enumerate(spec.get("parts", [])):
-    data = p["rawData"] if "rawData" in p else json.dumps(p["data"])
-    if ${spec.omitPartSessionId ? "True" : "False"}:
-        db.execute("INSERT INTO part (id,message_id,time_created,data) VALUES (?,?,?,?)",
-                   (f"prt_{i}", p["message_id"], p["time_created"], data))
-    else:
-        session_id = p.get("session_id") or message_sessions.get(p["message_id"], "")
-        db.execute("INSERT INTO part (id,message_id,session_id,time_created,data) VALUES (?,?,?,?,?)",
-                   (f"prt_{i}", p["message_id"], session_id, p["time_created"], data))
+if not spec.get("omitLegacyTables"):
+    db.execute("CREATE TABLE session (id TEXT PRIMARY KEY, parent_id TEXT, title TEXT, ${cwdColumn} TEXT, time_created INTEGER, time_updated INTEGER)")
+    db.execute("CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)")
+    db.execute("CREATE TABLE part (${partColumns})")
+    for s in spec.get("sessions", []):
+        db.execute(
+            "INSERT INTO session (id,parent_id,title,${cwdColumn},time_created,time_updated) VALUES (?,?,?,?,?,?)",
+            (s["id"], s.get("parent_id"), s.get("title"), s.get("directory"),
+             s.get("time_created", 1000), s.get("time_updated", 2000)))
+    for m in spec.get("messages", []):
+        db.execute(
+            "INSERT INTO message (id,session_id,time_created,time_updated,data) VALUES (?,?,?,?,?)",
+            (m["id"], m["session_id"], m["time_created"], m["time_created"],
+             json.dumps({"role": m["role"]})))
+    for i, p in enumerate(spec.get("parts", [])):
+        data = p["rawData"] if "rawData" in p else json.dumps(p["data"])
+        if ${spec.omitPartSessionId ? "True" : "False"}:
+            db.execute("INSERT INTO part (id,message_id,time_created,data) VALUES (?,?,?,?)",
+                       (f"prt_{i}", p["message_id"], p["time_created"], data))
+        else:
+            session_id = p.get("session_id") or message_sessions.get(p["message_id"], "")
+            db.execute("INSERT INTO part (id,message_id,session_id,time_created,data) VALUES (?,?,?,?,?)",
+                       (f"prt_{i}", p["message_id"], session_id, p["time_created"], data))
+if spec.get("v2Sessions") or spec.get("v2Messages") or spec.get("withV2Tables"):
+    db.execute("CREATE TABLE session_v2 (id TEXT PRIMARY KEY, parent_id TEXT, title TEXT, directory TEXT, version TEXT, time_created INTEGER, time_updated INTEGER)")
+    msg_columns = "id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT"
+    if spec.get("v2MessageOmitSeq"):
+        msg_columns = "id TEXT PRIMARY KEY, session_id TEXT, type TEXT, time_created INTEGER, time_updated INTEGER, data TEXT"
+    db.execute(f"CREATE TABLE session_message ({msg_columns})")
+    for s in spec.get("v2Sessions", []):
+        db.execute(
+            "INSERT INTO session_v2 (id,parent_id,title,directory,version,time_created,time_updated) VALUES (?,?,?,?,?,?,?)",
+            (s["id"], s.get("parent_id"), s.get("title"), s.get("directory"),
+             s.get("version"), s.get("time_created", 1000), s.get("time_updated", 2000)))
+    for m in spec.get("v2Messages", []):
+        if spec.get("v2MessageOmitSeq"):
+            db.execute(
+                "INSERT INTO session_message (id,session_id,type,time_created,time_updated,data) VALUES (?,?,?,?,?,?)",
+                (m["id"], m["session_id"], m["type"], m.get("time_created", 1000),
+                 m.get("time_created", 1000), json.dumps(m["data"])))
+        else:
+            db.execute(
+                "INSERT INTO session_message (id,session_id,type,seq,time_created,time_updated,data) VALUES (?,?,?,?,?,?,?)",
+                (m["id"], m["session_id"], m["type"], m["seq"], m.get("time_created", 1000),
+                 m.get("time_created", 1000), json.dumps(m["data"])))
 db.commit()
 for s in spec.get("walSessions", []):
     db.execute(
@@ -2015,6 +2068,285 @@ describe.skipIf(!SQLITE_PY)("opencode adapter", () => {
     const warnings: { code: string; message: string }[] = [];
     expect(opencodeExtractDialogue(stale, warnings)).toEqual([]);
     expect(warnings).toEqual([]);
+  });
+
+  // ---------- OpenCode 2.x storage ----------
+
+  it("lists session_v2 rows and prefers the v2 copy of a migrated id", () => {
+    buildOpencodeDb({
+      sessions: [
+        {
+          id: "ses_mig",
+          title: "legacy title",
+          directory: "/proj/a",
+          time_created: 1000,
+          time_updated: 2000,
+        },
+      ],
+      v2Sessions: [
+        // version says 1.18.x because the 2.x migration copied it verbatim;
+        // listing must still prefer this row over the legacy twin.
+        {
+          id: "ses_mig",
+          title: "migrated title",
+          version: "1.18.32",
+          time_created: 1000,
+          time_updated: 3000,
+        },
+        {
+          id: "ses_native",
+          title: "v2 native",
+          version: "2.0.12",
+          directory: "/proj/a",
+        },
+      ],
+    });
+    const rows = opencodeListSessions(mkFilter({ cwd: undefined }));
+    expect(rows).toHaveLength(2);
+    const migrated = rows.find((r) => r.id === "ses_mig");
+    expect(migrated?.title).toBe("migrated title");
+    expect(migrated?.updated).toBe(new Date(3000).toISOString());
+    expect(rows.find((r) => r.id === "ses_native")?.cwd).toBe("/proj/a");
+  });
+
+  it("lists from session_v2 alone when the legacy tables are absent", () => {
+    buildOpencodeDb({
+      omitLegacyTables: true,
+      v2Sessions: [
+        { id: "s2", title: "fresh v2", version: "2.0.12", directory: "/p" },
+      ],
+      v2Messages: [
+        {
+          id: "v2m1",
+          session_id: "s2",
+          type: "user",
+          seq: 0,
+          time_created: 10,
+          data: { text: "hello from 2.x" },
+        },
+      ],
+    });
+    expect(opencodeListSessions(mkFilter({ cwd: undefined })).map((r) => r.id)).toEqual(
+      ["s2"],
+    );
+    expect(opencodeExtractDialogue(ocSession("s2"))).toEqual([
+      { role: "user", text: "hello from 2.x" },
+    ]);
+  });
+
+  it("extracts v2 dialogue from session_message in seq order, dropping non-text content", () => {
+    buildOpencodeDb({
+      v2Sessions: [{ id: "s2", directory: "/p", version: "2.0.12" }],
+      // Inserted out of seq order on purpose: `seq`, not insertion or
+      // timestamp order, is the per-session dialogue order in 2.x.
+      v2Messages: [
+        {
+          id: "v2m2",
+          session_id: "s2",
+          type: "assistant",
+          seq: 7,
+          time_created: 20,
+          data: {
+            content: [
+              { type: "reasoning", text: "internal deliberation" },
+              { type: "text", text: "second chunk" },
+              {
+                type: "tool",
+                state: { input: { command: "ls" }, output: "a" },
+              },
+              { type: "text", text: "first chunk" },
+            ],
+          },
+        },
+        {
+          id: "v2m1",
+          session_id: "s2",
+          type: "user",
+          seq: 4,
+          time_created: 10,
+          data: { text: '"say hi"', files: [] },
+        },
+        {
+          id: "v2m3",
+          session_id: "s2",
+          type: "idle",
+          seq: 14,
+          time_created: 30,
+          data: { outcome: "succeeded" },
+        },
+      ],
+    });
+    expect(opencodeExtractDialogue(ocSession("s2"))).toEqual([
+      { role: "user", text: '"say hi"' },
+      { role: "assistant", text: "second chunk\n\nfirst chunk" },
+    ]);
+  });
+
+  it("reads a migrated session's dialogue from session_message, ignoring the legacy copies", () => {
+    buildOpencodeDb({
+      // The 2.x migration copies dialogue into `session_message` and leaves
+      // the legacy `message` / `part` rows in place, so a migrated session
+      // carries the same turns in both generations. Routing on the legacy
+      // rows (or reading both) would duplicate or misread it.
+      sessions: [
+        { id: "ses_mig", directory: "/p", time_created: 1000, time_updated: 2000 },
+      ],
+      v2Sessions: [{ id: "ses_mig", directory: "/p", version: "1.18.32" }],
+      messages: [
+        { id: "m_old", session_id: "ses_mig", time_created: 10, role: "user" },
+        { id: "m_old2", session_id: "ses_mig", time_created: 20, role: "assistant" },
+      ],
+      parts: [
+        {
+          message_id: "m_old",
+          time_created: 10,
+          data: { type: "text", text: "from migration" },
+        },
+        {
+          message_id: "m_old2",
+          time_created: 20,
+          data: { type: "text", text: "legacy reply" },
+        },
+      ],
+      v2Messages: [
+        {
+          id: "v2m1",
+          session_id: "ses_mig",
+          type: "user",
+          seq: 0,
+          time_created: 10,
+          data: { text: "from migration" },
+        },
+        {
+          id: "v2m2",
+          session_id: "ses_mig",
+          type: "assistant",
+          seq: 1,
+          time_created: 20,
+          data: { content: [{ type: "text", text: "v2 reply" }] },
+        },
+      ],
+    });
+    expect(opencodeExtractDialogue(ocSession("ses_mig"))).toEqual([
+      { role: "user", text: "from migration" },
+      { role: "assistant", text: "v2 reply" },
+    ]);
+  });
+
+  it("renders a completed v2 compaction row as a boundary marker and skips others", () => {
+    buildOpencodeDb({
+      v2Sessions: [{ id: "s2", directory: "/p" }],
+      v2Messages: [
+        {
+          id: "v2m1",
+          session_id: "s2",
+          type: "user",
+          seq: 0,
+          time_created: 10,
+          data: { text: "before compaction" },
+        },
+        {
+          id: "v2m2",
+          session_id: "s2",
+          type: "compaction",
+          seq: 1,
+          time_created: 15,
+          data: { status: "running", reason: "auto", summary: "partial", recent: "..." },
+        },
+        {
+          id: "v2m3",
+          session_id: "s2",
+          type: "compaction",
+          seq: 2,
+          time_created: 20,
+          data: { status: "completed", reason: "auto", summary: "the work so far", recent: "..." },
+        },
+      ],
+    });
+    const turns = opencodeExtractDialogue(ocSession("s2"));
+    expect(turns).toHaveLength(2);
+    expect(turns[0]).toEqual({ role: "user", text: "before compaction" });
+    expect(turns[1]?.kind).toBe("marker");
+    expect(turns[1]?.text.startsWith(COMPACT_BOUNDARY_PREFIX)).toBe(true);
+    expect(turns[1]?.text).toContain("the work so far");
+  });
+
+  it("searches v2 dialogue", () => {
+    buildOpencodeDb({
+      v2Sessions: [{ id: "s2", directory: "/p" }],
+      v2Messages: [
+        {
+          id: "v2m1",
+          session_id: "s2",
+          type: "user",
+          seq: 0,
+          time_created: 10,
+          data: { text: "find the hook bug" },
+        },
+        {
+          id: "v2m2",
+          session_id: "s2",
+          type: "assistant",
+          seq: 1,
+          time_created: 20,
+          data: { content: [{ type: "text", text: "the hook is here" }] },
+        },
+      ],
+    });
+    const hit = opencodeSearch(ocSession("s2"), "hook");
+    expect(hit.count).toBeGreaterThanOrEqual(2);
+    expect(hit.userCount).toBe(1);
+    expect(hit.asstCount).toBe(1);
+  });
+
+  it("serves v2 sessions from a prepared search store", () => {
+    buildOpencodeDb({
+      v2Sessions: [{ id: "s2", directory: "/p" }],
+      v2Messages: [
+        {
+          id: "v2m1",
+          session_id: "s2",
+          type: "user",
+          seq: 0,
+          time_created: 10,
+          data: { text: "stored once" },
+        },
+      ],
+    });
+    prepareOpencodeSessionStore(OPENCODE_DB);
+    nodeFs.rmSync(OPENCODE_DB, { force: true });
+    expect(opencodeExtractDialogue(ocSession("s2")).map((t) => t.text)).toEqual(
+      ["stored once"],
+    );
+    releaseOpencodeSessionStore();
+    expect(opencodeExtractDialogue(ocSession("s2"))).toEqual([]);
+  });
+
+  it("warns with opencode-db-schema-unsupported when session_message lacks the seq column", () => {
+    buildOpencodeDb({
+      v2Sessions: [{ id: "s2", directory: "/p" }],
+      v2Messages: [
+        {
+          id: "v2m1",
+          session_id: "s2",
+          type: "user",
+          seq: 0,
+          time_created: 10,
+          data: { text: "hi" },
+        },
+      ],
+      v2MessageOmitSeq: true,
+    });
+    // Listing only reads the session tables, so it still works.
+    expect(opencodeListSessions(mkFilter({ cwd: undefined })).map((r) => r.id)).toEqual(
+      ["s2"],
+    );
+    // Dialogue is contract-checked and fails closed.
+    const warnings: { code: string; message: string }[] = [];
+    expect(opencodeExtractDialogue(ocSession("s2"), warnings)).toEqual([]);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]?.code).toBe("opencode-db-schema-unsupported");
+    expect(warnings[0]?.message).toContain("seq");
   });
 });
 

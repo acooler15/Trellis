@@ -333,7 +333,7 @@ zero-dependency parser as ZCode / OpenCode. This is **not** `trellis init
 - **Out of v1**: Devin Cloud, Desktop Cascade, `transcripts/*.json`,
   `--include-children` (local `subagent_heads` is unused).
 
-### OpenCode (reader unavailable as of 0.6.0-beta.4+)
+### OpenCode
 
 In 0.6.0-beta.3 a SQLite-backed reader was added for OpenCode 1.2+
 (which migrated from JSON tree to `~/.local/share/opencode/opencode.db`).
@@ -345,29 +345,39 @@ install at all on machines that did not have a C toolchain. 0.6.0-beta.4
 reverted the dependency. See `quality-guidelines.md` "Native dependency
 policy" for the broader rule.
 
-Current behavior:
+The reader is back via the zero-dependency SQLite page parser in
+`core/mem/internal/sqlite-readonly.ts` (no native module, WASM blob,
+system `sqlite3`, or install-time build step may come back). All three
+entry points live in `core/mem/adapters/opencode.ts`.
 
-- `opencodeListSessions` returns `[]`.
-- `opencodeExtractDialogue` returns `[]`.
-- `opencodeSearch` returns an empty hit.
-- All three call `warnOpencodeUnavailable()` which writes one stderr line
-  per process (cached via module-level flag).
+**Storage generations** (verified against sst/opencode v1.18.32 / v2.0.12
+sources and live stores of each):
 
-Re-enabling OpenCode requires an install-resilient backend. Acceptable
-options, ordered by preference:
+- 1.x (any 1.2+ build) writes the legacy `session` / `message` / `part`
+  tables — role in `message.data.role`, text in `part` rows.
+- 2.x writes `session_v2` / `session_message` — role moved to the
+  `session_message.type` column, order to `seq`, and the text lives
+  inline in `data` (`data.text` for user, `data.content[]` for
+  assistant; no `part` rows). Compaction is a `type:"compaction"` row
+  with `data.status:"completed"` carrying `data.summary`; 2.x never
+  prunes compacted turns.
+- On first start 2.x migrates a 1.x store: sessions are copied into
+  `session_v2` (the `version` column is copied verbatim — migrated rows
+  say "1.18.x", so routing must never key on it) and messages+parts are
+  folded into `session_message`; the legacy rows stay in the file. A
+  1.18.x binary run afterwards keeps appending legacy-only sessions.
 
-1. **Pure-JS / WASM** — `sql.js` bundled WASM. No native build, identical
-   bytes on every platform, slightly higher memory cost.
-2. **Shell-out** — invoke the user's system `sqlite3` CLI when present;
-   skip OpenCode with a clear message when absent. No native build, zero
-   bundle cost, depends on host.
-3. **`node:sqlite`** — once it graduates from experimental in Node LTS.
-   Native but ships with the runtime, no install-time compile.
-4. **`optionalDependencies` + soft-degrade** — only as a last resort, and
-   only if the soft-degrade path matches today's "empty list + one-shot
-   warning" UX exactly so a missing dep does not regress install reliability.
+Adapter rules that follow:
 
-See follow-up task notes.
+- Listing reads both session tables and dedupes by id, `session_v2`
+  row winning.
+- Dialogue routes per session: sessions present in `session_v2` read
+  `session_message` only; the rest read the legacy tables. Merging
+  both generations would duplicate every turn of a migrated session.
+- Absent tables mean "that generation never wrote here" (not an
+  error); a present generation that misses its contract columns fails
+  closed with `opencode-db-schema-unsupported`, as does a store with
+  neither session table.
 
 ### `SessionInfo` contract
 
