@@ -1177,7 +1177,7 @@ export default {
 }
 ```
 
-v1 calls `server()` and ignores `setup`; v2 calls `setup(ctx)` and ignores `server` (per OpenCode's v1→v2 plugin migration guide). 1.18.29 is the minimum supported v1 because that release added the object entrypoint — older 1.x iterated module exports and invoked each as a function. The v2 session identity comes from `ctx.location.directory`; hook registration auto-disposes on plugin unload.
+v1 calls `server()` and ignores `setup`; v2 calls `setup(ctx)` and ignores `server` (per OpenCode's v1→v2 plugin migration guide). 1.18.29 is the minimum supported v1 because that release added the object entrypoint — older 1.x iterated module exports and invoked each as a function. The v2 project directory comes from `ctx.location.directory`; session identity comes from each hook event's `sessionID` / `agent`. Hook registration auto-disposes on plugin unload.
 
 **Required contract** for any per-turn OpenCode context plugin (v1 `experimental.chat.messages.transform`, v2 `ctx.session.hook("context", ...)`):
 
