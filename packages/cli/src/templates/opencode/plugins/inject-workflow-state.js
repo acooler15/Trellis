@@ -255,14 +255,14 @@ export default {
   },
 
   // OpenCode v2: `setup(ctx)` registers the domain-hook equivalent.
-  // v1 >= 1.18.29 also calls `setup()` through its v2 compat host, but that
-  // PluginContext carries only options/agent/aisdk/catalog/command/
-  // integration/plugin/reference/skill — no location and no session domain.
-  // Stand down there: v1 already injected through `server()`.
+  // v1 never calls `setup()` on a module that exports `server()` — its loader
+  // short-circuits on the `server` export, so v1 injection happens entirely
+  // through `server()`. Stand down on any host that calls `setup()` without
+  // the location/session domains: registration needs the real v2 context.
   async setup(pluginCtx) {
     const directory = pluginCtx?.location?.directory
     if (!directory || !pluginCtx?.session?.hook) {
-      debugLog("workflow-state", "setup() skipped: host has no location/session domain (v1 compat host)")
+      debugLog("workflow-state", "setup() skipped: host has no location/session domain (incomplete setup context)")
       return
     }
     const ctx = new TrellisContext(directory)

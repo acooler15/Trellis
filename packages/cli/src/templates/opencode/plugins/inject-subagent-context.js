@@ -595,11 +595,13 @@ export default {
 
   async setup(pluginCtx) {
     const directory = pluginCtx?.location?.directory
-    // v1 >= 1.18.29 also calls `setup()` via its v2 compat host, whose
-    // PluginContext has no location and no tool domain. Stand down there:
-    // v1 already injected through `server()`.
+    // v1 never calls `setup()` on a module that exports `server()` — its
+    // loader short-circuits on the `server` export, so v1 injection happens
+    // entirely through `server()`. Stand down on any host that calls
+    // `setup()` without the location/tool domains: registration needs the
+    // real v2 context.
     if (!directory || !pluginCtx?.tool?.hook) {
-      debugLog("inject", "setup() skipped: host has no location/tool domain (v1 compat host)")
+      debugLog("inject", "setup() skipped: host has no location/tool domain (incomplete setup context)")
       return
     }
     const ctx = new TrellisContext(directory)
